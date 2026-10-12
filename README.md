@@ -42,6 +42,9 @@ curl -o report.pdf "http://localhost:8000/screenshots?url=https://example.com&to
 curl -H "X-API-Token: YOUR_SECRET" -o report.pdf \
      "http://localhost:8000/screenshots?url=https://example.com"
 
+# Stats as JSON (CWV, category scores, lab metrics) - nothing saved to disk
+curl "http://localhost:8000/screenshots?url=https://example.com&token=YOUR_SECRET&output=json"
+
 # PNG screenshots (saved on disk, JSON response)
 curl "http://localhost:8000/screenshots?url=https://example.com&token=YOUR_SECRET&output=screenshots"
 ```
@@ -52,7 +55,7 @@ Screenshot files are served at `http://localhost:8000/files/<run>/<image>.png`.
 
 | Method | Path           | Description                                   |
 |--------|----------------|-----------------------------------------------|
-| GET    | `/screenshots` | `url`, `token`, `output=pdf|screenshots`      |
+| GET    | `/screenshots` | `url`, `token`, `output=pdf|json|screenshots`      |
 | GET    | `/files/...`   | Serve saved screenshots                       |
 | GET    | `/health`      | Health check                                  |
 
@@ -66,10 +69,28 @@ Screenshot files are served at `http://localhost:8000/files/<run>/<image>.png`.
 | `SETTLE_MS`         | `3000`          | Extra wait after results appear                      |
 | `PRE_PDF_WAIT_MS`   | `2000`          | Final wait right before printing the PDF             |
 | `DEBUG_DIR`         | (unset)         | If set, saves screenshot + HTML when results time out|
+| `LOG_LEVEL`         | `INFO`          | DEBUG, INFO, WARNING or ERROR                        |
 | `SCREENSHOT_DIR`    | `./screenshots` | Folder for PNG screenshots                           |
 | `USE_SYSTEM_CHROME` | `false`         | `true` uses installed Google Chrome                  |
 | `MAX_CONCURRENT`    | `1`             | Simultaneous browser jobs                            |
 | `PDF_SINGLE_PAGE`   | `true`          | One tall PDF page vs paged A4                        |
+
+## Logging
+
+Each request gets a short id and logs its progress to stdout (visible in the terminal and in Render's Logs tab):
+
+```
+12:01:07 INFO    [a1b2c3d4] Request received: url=https://example.com output=json
+12:01:08 INFO    [a1b2c3d4] Launching headless Chromium
+12:01:12 INFO    [a1b2c3d4] Submitted https://example.com - analysis started
+12:01:17 INFO    [a1b2c3d4] Waiting for Lighthouse lab results (max 300s)
+12:01:32 INFO    [a1b2c3d4] Lab results not ready yet - still waiting (15s elapsed)
+...
+12:03:20 INFO    [a1b2c3d4] Report ready (waited 123s in total)
+12:03:21 INFO    [a1b2c3d4] Finished in 134s
+```
+
+The `token=` value in uvicorn's access log is replaced with `***`.
 
 ## Notes
 
@@ -79,3 +100,26 @@ Screenshot files are served at `http://localhost:8000/files/<run>/<image>.png`.
 - Single-page PDFs are capped at about 18000 px (Chromium limit); taller reports fall back to paged A4.
 - If pagespeed.web.dev changes its markup, update the selectors in `wait_for_results` and `SECTIONS`.
 - Keep `.env` out of version control and put HTTPS in front of the service if it is public.
+
+## Deploying on Render
+
+Chromium has to be installed at build time, together with its Linux libraries.
+The simplest reliable way is Docker (a `Dockerfile` is included).
+
+1. Push the repo (with `Dockerfile`, `app.py`, `requirements.txt`) to GitHub. Do **not** commit `.env`.
+2. In Render, create a **Web Service** and choose **Docker** as the runtime (not "Python").
+3. Under **Environment**, add `API_SECRET_TOKEN` (and any other variables from `.env.example`).
+4. Deploy. Render sets `$PORT` automatically and the Dockerfile uses it.
+
+Notes:
+- Chromium needs memory. Render's smallest/free instances (512 MB) may crash during a long run; use a larger plan if you see out-of-memory restarts.
+- A run can take up to 5 minutes. Check that your plan's and client's request timeouts allow that.
+- Don't put the real token in shared URLs or screenshots; prefer the `X-API-Token` header.
+
+### Without Docker (native Python runtime)
+
+Set the build command to
+`pip install -r requirements.txt && playwright install chromium`
+and add the env var `PLAYWRIGHT_BROWSERS_PATH=/opt/render/project/.playwright`
+so the browser is stored in the project folder and survives into runtime. This can still fail
+on missing system libraries, which is why Docker is recommended.
