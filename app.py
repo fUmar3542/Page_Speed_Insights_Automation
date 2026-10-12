@@ -13,7 +13,9 @@ Call:
     (token can also be sent as header:  X-API-Token: YOUR_SECRET)
 
     output=pdf          (default) -> PDF bytes returned directly, nothing saved to disk
-    output=json         -> stats (CWV, scores, lab metrics) as JSON, nothing saved to disk
+    output=json         -> stats as JSON, nothing saved to disk
+                           filter=bad (default) returns only metrics that are NOT "good"
+                           filter=all  returns every metric plus the raw values
     output=screenshots  -> PNGs saved in SCREENSHOT_DIR/<run>/, JSON response
 """
 
@@ -209,6 +211,7 @@ STAT_PATTERNS = {
     "CLS": r"Cumulative Layout Shift[^\d]*([\d\.]+)",
     "FCP": r"First Contentful Paint[^\d]*([\d\.]+\s*s)",
     "Total Blocking Time": r"Total Blocking Time[^\d]*([\d,]+\s*ms)",
+    "TTFB": r"Time to First Byte[^\d]*([\d\.]+\s*m?s)",
 }
 
 
@@ -251,6 +254,122 @@ async def extract_stats(page) -> dict:
         sum(v is not None for v in stats.values()), len(stats), len(scores), len(lab_metrics),
     )
     return {"stats": stats, "scores": scores, "lab_metrics": lab_metrics}
+
+
+# ----------------------------------------------------------------------------
+# Rating: Good / Needs improvement / Poor
+#   name: (unit, good_max, poor_above)   -> good if v <= good_max, poor if v > poor_above
+# ----------------------------------------------------------------------------
+THRESHOLDS = {
+    "LCP": ("s", 2.5, 4.0),
+    "INP": ("ms", 200, 500),
+    "CLS": ("", 0.1, 0.25),
+    "FCP": ("s", 1.8, 3.0),
+    "TTFB": ("s", 0.8, 1.8),
+    "TBT": ("ms", 200, 600),
+    "SI": ("s", 3.4, 5.8),
+}
+# where each metric is read from: field data = real users (regex stats), lab = Lighthouse run
+FIELD_KEYS = {"LCP": "LCP (Mobile)", "INP": "INP", "CLS": "CLS", "FCP": "FCP", "TTFB": "TTFB"}
+LAB_KEYS = {
+    "LCP": "Largest Contentful Paint",
+    "CLS": "Cumulative Layout Shift",
+    "FCP": "First Contentful Paint",
+    "TBT": "Total Blocking Time",
+    "SI": "Speed Index",
+}
+RATING_ORDER = {"poor": 0, "needs_improvement": 1, "good": 2}
+
+
+def parse_value(raw: Optional[str], unit: str) -> Optional[float]:
+    """'2.2 s' / '484 ms' / '1,800 ms' / '0.01' -> number in the metric's unit (s, ms or unitless)."""
+    if not raw:
+        return None
+    m = re.search(r"([\d,]*\.?\d+)\s*(ms|s)?\b", raw.strip(), re.IGNORECASE)
+    if not m:
+        return None
+    num = float(m.group(1).replace(",", ""))
+    found = (m.group(2) or "").lower()
+    if unit == "":
+        return num
+    if not found:
+        return None  # a time metric without a unit - don't guess
+    if unit == "ms":
+        return num * 1000 if found == "s" else num
+    return num / 1000 if found == "ms" else num
+
+
+def rate(value: float, good_max: float, poor_above: float) -> str:
+    if value <= good_max:
+        return "good"
+    if value > poor_above:
+        return "poor"
+    return "needs_improvement"
+
+
+def evaluate(data: dict) -> dict:
+    """Rate every metric we could read. Returns {'metrics': [...], 'unavailable': [...]}."""
+    metrics: list = []
+    unavailable: list = []
+
+    # Overall Lighthouse Performance score: 90-100 good, 50-89 needs improvement, 0-49 poor
+    raw_score = data["scores"].get("Performance")
+    if raw_score and raw_score.strip().isdigit():
+        score = int(raw_score)
+        rating = "good" if score >= 90 else "needs_improvement" if score >= 50 else "poor"
+        metrics.append({
+            "metric": "Performance score", "source": "lab", "value": raw_score.strip(),
+            "rating": rating, "good": ">= 90", "poor": "< 50",
+        })
+    else:
+        unavailable.append("Performance score")
+
+    for name, (unit, good_max, poor_above) in THRESHOLDS.items():
+        for source, mapping, bucket in (
+            ("field", FIELD_KEYS, data["stats"]),
+            ("lab", LAB_KEYS, data["lab_metrics"]),
+        ):
+            key = mapping.get(name)
+            if not key:
+                continue  # this metric isn't reported in that source
+            raw = bucket.get(key)
+            value = parse_value(raw, unit)
+            if value is None:
+                unavailable.append(f"{name} ({source})")
+                continue
+            suffix = f" {unit}" if unit else ""
+            metrics.append({
+                "metric": name, "source": source, "value": raw.strip(),
+                "rating": rate(value, good_max, poor_above),
+                "good": f"<= {good_max:g}{suffix}", "poor": f"> {poor_above:g}{suffix}",
+            })
+
+    return {"metrics": metrics, "unavailable": unavailable}
+
+
+def build_json_response(url: str, data: dict, filter_mode: str) -> dict:
+    result = evaluate(data)
+    metrics = sorted(result["metrics"], key=lambda m: RATING_ORDER[m["rating"]])
+    counts = {r: sum(m["rating"] == r for m in metrics) for r in RATING_ORDER}
+    summary = {
+        "cwv_assessment": data["stats"].get("CWV Status"),
+        "checked": len(metrics),
+        "poor": counts["poor"],
+        "needs_improvement": counts["needs_improvement"],
+        "good": counts["good"],
+        "unavailable": result["unavailable"],
+    }
+    log.info(
+        "Rated %d metrics: %d poor, %d need improvement, %d good (filter=%s)",
+        len(metrics), counts["poor"], counts["needs_improvement"], counts["good"], filter_mode,
+    )
+
+    if filter_mode == "bad":
+        return {
+            "url": url, "filter": "bad", "summary": summary,
+            "issues": [m for m in metrics if m["rating"] != "good"],
+        }
+    return {"url": url, "filter": "all", "summary": summary, "metrics": metrics, **data}
 
 
 async def run_capture(target_url: str, output: str, folder: Optional[Path]) -> dict:
@@ -374,11 +493,12 @@ async def screenshots(
     url: str = Query(..., description="URL to analyse on PageSpeed Insights"),
     token: Optional[str] = Query(None, description="Secret token (or use X-API-Token header)"),
     output: str = Query("pdf", pattern="^(pdf|json|screenshots)$", description="pdf (default) | json | screenshots"),
+    filter_mode: str = Query("bad", alias="filter", pattern="^(bad|all)$", description="json only: bad (default) | all"),
     x_api_token: Optional[str] = Header(None),
 ):
     request_id.set(uuid.uuid4().hex[:8])
     t0 = time.monotonic()
-    log.info("Request received: url=%s output=%s", url, output)
+    log.info("Request received: url=%s output=%s%s", url, output, f" filter={filter_mode}" if output == "json" else "")
     check_token(token or x_api_token)
     validate_url(url)
 
@@ -413,7 +533,7 @@ async def screenshots(
     if output == "json":
         if not result["data"]:
             raise HTTPException(504, "PageSpeed results did not finish loading in time")
-        return {"url": url, **result["data"]}
+        return build_json_response(url, result["data"], filter_mode)
 
     return {
         "url": url,
